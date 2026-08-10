@@ -1,10 +1,12 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { fetchYear } from './fetchCarol.js'
 import { normalizeRecord } from './normalize.js'
 import { buildDensityGrid } from './densityGrid.js'
-import type { Accident, AccidentDetail, AccidentPoint } from './types.js'
+import { buildTiles } from './tiling.js'
+import { buildYearCountsByState } from './yearCounts.js'
+import type { Accident } from './types.js'
 
 const START_YEAR = 2000
 const END_YEAR = new Date().getUTCFullYear()
@@ -45,40 +47,35 @@ async function main() {
   const accidentList = [...accidents.values()].sort((a, b) => a.date.localeCompare(b.date))
   const densityGrid = buildDensityGrid(accidentList)
 
-  // Split: the browser only needs point/color/filter fields to render the map. Everything else
-  // (narrative, aircraft, registration, source link) is fetched lazily, in the background, so
-  // first paint isn't blocked on a ~20MB download.
-  const points: AccidentPoint[] = accidentList.map((a) => ({
-    id: a.id,
-    latitude: a.latitude,
-    longitude: a.longitude,
-    state: a.state,
-    year: new Date(a.date).getUTCFullYear(),
-    fatalities: a.fatalities,
-  }))
+  // Spatially tiled: the browser only fetches points/details for tiles intersecting whatever's
+  // currently in the camera's view, instead of every accident on every visit. See tiling.ts.
+  const { pointsByTile, detailsByTile, manifest, states } = buildTiles(accidentList)
 
-  const detailsById: Record<string, AccidentDetail> = {}
-  for (const a of accidentList) {
-    detailsById[a.id] = {
-      date: a.date,
-      location: a.location,
-      aircraftMake: a.aircraftMake,
-      aircraftModel: a.aircraftModel,
-      registration: a.registration,
-      injurySummary: a.injurySummary,
-      accidentType: a.accidentType,
-      summary: a.summary,
-      sourceUrl: a.sourceUrl,
-    }
-  }
+  const pointsDir = path.join(OUTPUT_DIR, 'tiles', 'points')
+  const detailsDir = path.join(OUTPUT_DIR, 'tiles', 'details')
+  await rm(path.join(OUTPUT_DIR, 'tiles'), { recursive: true, force: true })
+  await mkdir(pointsDir, { recursive: true })
+  await mkdir(detailsDir, { recursive: true })
 
-  await mkdir(OUTPUT_DIR, { recursive: true })
-  await writeFile(path.join(OUTPUT_DIR, 'accidents.json'), JSON.stringify(points))
-  await writeFile(path.join(OUTPUT_DIR, 'accident-details.json'), JSON.stringify(detailsById))
+  await Promise.all([
+    ...[...pointsByTile.entries()].map(([key, points]) =>
+      writeFile(path.join(pointsDir, `${key}.json`), JSON.stringify(points)),
+    ),
+    ...[...detailsByTile.entries()].map(([key, details]) =>
+      writeFile(path.join(detailsDir, `${key}.json`), JSON.stringify(details)),
+    ),
+  ])
+
+  const yearCountsByState = buildYearCountsByState(accidentList)
+
+  await writeFile(path.join(OUTPUT_DIR, 'tiles', 'manifest.json'), JSON.stringify(manifest))
+  await writeFile(path.join(OUTPUT_DIR, 'states.json'), JSON.stringify(states))
   await writeFile(path.join(OUTPUT_DIR, 'density-grid.json'), JSON.stringify(densityGrid))
+  await writeFile(path.join(OUTPUT_DIR, 'year-counts-by-state.json'), JSON.stringify(yearCountsByState))
 
-  const pointsSize = Buffer.byteLength(JSON.stringify(points))
-  const detailsSize = Buffer.byteLength(JSON.stringify(detailsById))
+  const totalPointsSize = [...pointsByTile.values()].reduce((n, p) => n + Buffer.byteLength(JSON.stringify(p)), 0)
+  const totalDetailsSize = [...detailsByTile.values()].reduce((n, d) => n + Buffer.byteLength(JSON.stringify(d)), 0)
+  const tileSizes = [...pointsByTile.values()].map((p) => p.length).sort((a, b) => a - b)
 
   console.log('\n--- Summary ---')
   console.log(`Years: ${START_YEAR}-${END_YEAR}`)
@@ -87,8 +84,10 @@ async function main() {
   console.log(`Dropped (missing coordinates/date): ${droppedNoCoords}`)
   console.log(`Coordinate coverage: ${((accidentList.length / totalRaw) * 100).toFixed(1)}%`)
   console.log(`Density grid cells: ${densityGrid.length}`)
-  console.log(`accidents.json (map-critical, blocks first render): ${(pointsSize / 1024 / 1024).toFixed(1)} MB`)
-  console.log(`accident-details.json (background-loaded): ${(detailsSize / 1024 / 1024).toFixed(1)} MB`)
+  console.log(`States: ${states.length}`)
+  console.log(`Tiles: ${manifest.length} (median ${tileSizes[Math.floor(tileSizes.length / 2)]} pts, max ${tileSizes[tileSizes.length - 1]} pts)`)
+  console.log(`tiles/points total: ${(totalPointsSize / 1024 / 1024).toFixed(1)} MB across ${manifest.length} files`)
+  console.log(`tiles/details total: ${(totalDetailsSize / 1024 / 1024).toFixed(1)} MB across ${manifest.length} files`)
 }
 
 main().catch((err) => {

@@ -2,17 +2,19 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as Cesium from 'cesium'
 import type { AccidentPoint, DensityCell } from '@/types/accident'
+import { useAccidentsData, type ViewBounds } from '@/composables/useAccidentsData'
 
 const props = defineProps<{
-  accidents: AccidentPoint[]
-  densityGrid: DensityCell[]
   showMarkers: boolean
   showDensity: boolean
 }>()
 
 const emit = defineEmits<{
   select: [point: AccidentPoint]
+  'zoomed-out-change': [zoomedOut: boolean]
 }>()
+
+const { filteredPoints, densityGrid, ensureTilesLoaded } = useAccidentsData()
 
 const container = ref<HTMLDivElement | null>(null)
 let viewer: Cesium.Viewer | null = null
@@ -26,12 +28,23 @@ const CONUS_SOUTH = 24
 const CONUS_EAST = -66
 const CONUS_NORTH = 50
 
+// Above this camera altitude, individual markers aren't fetched or rendered — only the density
+// layer is shown. Keeps rendered/clustered entity counts bounded regardless of how much data
+// the active year filter would otherwise match (e.g. "All time" is 39k+ points).
+const MARKER_ALTITUDE_THRESHOLD_METERS = 800_000
+// Height above the ellipsoid for accident markers — see the comment at their entity definition.
+const MARKER_HEIGHT_METERS = 1_000
+// Extra margin (degrees) around the current view when deciding which tiles/points to load and
+// render, so markers don't visibly pop in right at the viewport edge while panning.
+const VIEW_BUFFER_DEGREES = 2
+
 const DENSITY_COLORS: Record<DensityCell['tier'], Cesium.Color> = {
   red: Cesium.Color.fromCssColorString('#e5484d').withAlpha(0.45),
   orange: Cesium.Color.fromCssColorString('#f2872c').withAlpha(0.4),
   yellow: Cesium.Color.fromCssColorString('#e8c547').withAlpha(0.35),
 }
 
+const CLUSTER_ICON_SIZE = 48 // logical (CSS) pixels — see explicit billboard width/height below
 const clusterIconCache = new Map<number, string>()
 
 function getClusterIcon(count: number): string {
@@ -39,15 +52,21 @@ function getClusterIcon(count: number): string {
   const cached = clusterIconCache.get(count)
   if (cached) return cached
 
-  const size = 48
+  // Draw at devicePixelRatio so the icon stays crisp on retina/high-DPI displays — a canvas
+  // backed 1:1 with CSS pixels gets upscaled by the browser/GPU and looks soft. The billboard's
+  // width/height are pinned to CLUSTER_ICON_SIZE (see clusterEvent below) so the on-screen size
+  // stays the same regardless of the backing resolution.
+  const dpr = window.devicePixelRatio || 1
+  const size = CLUSTER_ICON_SIZE
   const canvas = document.createElement('canvas')
-  canvas.width = size
-  canvas.height = size
+  canvas.width = size * dpr
+  canvas.height = size * dpr
   const ctx = canvas.getContext('2d')!
+  ctx.scale(dpr, dpr)
 
   ctx.beginPath()
   ctx.arc(size / 2, size / 2, size / 2 - 2, 0, 2 * Math.PI)
-  ctx.fillStyle = 'rgba(79, 143, 209, 0.85)'
+  ctx.fillStyle = 'rgba(79, 143, 209, 0.95)'
   ctx.fill()
   ctx.lineWidth = 2
   ctx.strokeStyle = '#eef2f7'
@@ -64,17 +83,38 @@ function getClusterIcon(count: number): string {
   return dataUrl
 }
 
-function buildAccidentsDataSource(accidents: AccidentPoint[]): Cesium.CustomDataSource {
+let currentBounds: ViewBounds | null = null
+
+function boundsWithBuffer(rect: Cesium.Rectangle): ViewBounds {
+  return {
+    west: Cesium.Math.toDegrees(rect.west) - VIEW_BUFFER_DEGREES,
+    south: Cesium.Math.toDegrees(rect.south) - VIEW_BUFFER_DEGREES,
+    east: Cesium.Math.toDegrees(rect.east) + VIEW_BUFFER_DEGREES,
+    north: Cesium.Math.toDegrees(rect.north) + VIEW_BUFFER_DEGREES,
+  }
+}
+
+function pointInBounds(p: AccidentPoint, bounds: ViewBounds): boolean {
+  return p.longitude >= bounds.west && p.longitude <= bounds.east && p.latitude >= bounds.south && p.latitude <= bounds.north
+}
+
+function buildAccidentsDataSource(points: AccidentPoint[]): Cesium.CustomDataSource {
   const dataSource = new Cesium.CustomDataSource('accidents')
   accidentById.clear()
 
-  for (const accident of accidents) {
+  for (const accident of points) {
     accidentById.set(accident.id, accident)
     dataSource.entities.add({
       id: accident.id,
-      position: Cesium.Cartesian3.fromDegrees(accident.longitude, accident.latitude),
+      // Raised above ground level (imperceptible at any zoom level we render at) so markers are
+      // unambiguously nearer to the camera than the density overlay and win normal depth
+      // testing outright, instead of getting alpha-blended with it and looking dim/muddy.
+      position: Cesium.Cartesian3.fromDegrees(accident.longitude, accident.latitude, MARKER_HEIGHT_METERS),
       point: {
-        pixelSize: 6,
+        // At pixelSize 6, the antialiased edge and outline consumed most of the circle, leaving
+        // little solid fill — read as pale/fuzzy rather than a crisp dot. A larger fill with a
+        // thin outline reads solid at typical zoom levels.
+        pixelSize: 9,
         color: (accident.fatalities ?? 0) > 0 ? Cesium.Color.fromCssColorString('#e5484d') : Cesium.Color.fromCssColorString('#4f8fd1'),
         outlineColor: Cesium.Color.WHITE,
         outlineWidth: 1,
@@ -92,6 +132,8 @@ function buildAccidentsDataSource(accidents: AccidentPoint[]): Cesium.CustomData
     cluster.label.show = false
     cluster.billboard.show = true
     cluster.billboard.image = getClusterIcon(clusteredEntities.length)
+    cluster.billboard.width = CLUSTER_ICON_SIZE
+    cluster.billboard.height = CLUSTER_ICON_SIZE
     cluster.billboard.verticalOrigin = Cesium.VerticalOrigin.CENTER
     cluster.billboard.horizontalOrigin = Cesium.HorizontalOrigin.CENTER
     cluster.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY
@@ -124,9 +166,49 @@ function flyToConus(durationSeconds = 1.2): void {
 }
 
 function raiseMarkersAboveDensity(): void {
-  // The density overlay is ground-clamped and translucent; without an explicit z-order,
-  // whichever data source was (re)added most recently paints on top, dimming the markers.
+  // Without an explicit z-order, whichever data source was (re)added most recently paints on
+  // top — keep markers above the density overlay.
   if (viewer && accidentsDataSource) viewer.dataSources.raiseToTop(accidentsDataSource)
+}
+
+function rebuildAccidentsDataSource(): void {
+  if (!viewer) return
+  const bounds = currentBounds
+  const visible = bounds ? filteredPoints.value.filter((p) => pointInBounds(p, bounds)) : []
+
+  if (accidentsDataSource) viewer.dataSources.remove(accidentsDataSource, true)
+  accidentsDataSource = buildAccidentsDataSource(visible)
+  accidentsDataSource.show = props.showMarkers
+  viewer.dataSources.add(accidentsDataSource)
+  raiseMarkersAboveDensity()
+}
+
+let lastZoomedOut: boolean | null = null
+
+function setZoomedOut(zoomedOut: boolean): void {
+  if (zoomedOut === lastZoomedOut) return
+  lastZoomedOut = zoomedOut
+  emit('zoomed-out-change', zoomedOut)
+}
+
+async function refreshMarkers(): Promise<void> {
+  if (!viewer) return
+  const height = viewer.camera.positionCartographic.height
+
+  if (height > MARKER_ALTITUDE_THRESHOLD_METERS) {
+    currentBounds = null
+    setZoomedOut(true)
+    rebuildAccidentsDataSource()
+    return
+  }
+  setZoomedOut(false)
+
+  const rect = viewer.camera.computeViewRectangle(viewer.scene.globe.ellipsoid)
+  if (!rect) return
+  currentBounds = boundsWithBuffer(rect)
+
+  await ensureTilesLoaded(currentBounds)
+  rebuildAccidentsDataSource()
 }
 
 function isInteractivePick(picked: unknown): boolean {
@@ -195,15 +277,18 @@ onMounted(() => {
   viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0a0e14')
   flyToConus(0)
 
-  accidentsDataSource = buildAccidentsDataSource(props.accidents)
-  accidentsDataSource.show = props.showMarkers
-  viewer.dataSources.add(accidentsDataSource)
-
-  densityDataSource = buildDensityDataSource(props.densityGrid)
+  densityDataSource = buildDensityDataSource(densityGrid.value)
   densityDataSource.show = props.showDensity
   viewer.dataSources.add(densityDataSource)
 
-  raiseMarkersAboveDensity()
+  accidentsDataSource = new Cesium.CustomDataSource('accidents')
+  accidentsDataSource.show = props.showMarkers
+  viewer.dataSources.add(accidentsDataSource)
+
+  viewer.camera.moveEnd.addEventListener(() => {
+    void refreshMarkers()
+  })
+  void refreshMarkers()
 
   viewer.screenSpaceEventHandler.setInputAction(handleClick, Cesium.ScreenSpaceEventType.LEFT_CLICK)
   viewer.screenSpaceEventHandler.setInputAction(handleMouseMove, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
@@ -214,29 +299,11 @@ onBeforeUnmount(() => {
   viewer = null
 })
 
-watch(
-  () => props.accidents,
-  (accidents) => {
-    if (!viewer || !accidentsDataSource) return
-    viewer.dataSources.remove(accidentsDataSource, true)
-    accidentsDataSource = buildAccidentsDataSource(accidents)
-    accidentsDataSource.show = props.showMarkers
-    viewer.dataSources.add(accidentsDataSource)
-    raiseMarkersAboveDensity()
-  },
-)
-
-watch(
-  () => props.densityGrid,
-  (cells) => {
-    if (!viewer || !densityDataSource) return
-    viewer.dataSources.remove(densityDataSource, true)
-    densityDataSource = buildDensityDataSource(cells)
-    densityDataSource.show = props.showDensity
-    viewer.dataSources.add(densityDataSource)
-    raiseMarkersAboveDensity()
-  },
-)
+// New tiles arriving, or the state/year filter changing, both change what filteredPoints
+// contains for the area already in view — re-render against the (unchanged) current bounds.
+watch(filteredPoints, () => {
+  rebuildAccidentsDataSource()
+})
 
 watch(
   () => props.showMarkers,

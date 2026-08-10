@@ -7,23 +7,29 @@ import { useAccidentsData } from '@/composables/useAccidentsData'
 import type { AccidentPoint } from '@/types/accident'
 
 const {
-  filteredPoints,
-  densityGrid,
   detailsById,
   availableStates,
   stateFilter,
   yearFilter,
+  filteredCount,
   loading,
   error,
   load,
+  ensureDetail,
 } = useAccidentsData()
 
 const showMarkers = ref(true)
 const showDensity = ref(true)
 const selectedPoint = ref<AccidentPoint | null>(null)
 const globeRef = ref<InstanceType<typeof CesiumGlobe> | null>(null)
+const zoomedOut = ref(true)
 
 onMounted(load)
+
+function selectPoint(point: AccidentPoint): void {
+  selectedPoint.value = point
+  void ensureDetail(point.id, point.latitude, point.longitude)
+}
 </script>
 
 <template>
@@ -31,12 +37,18 @@ onMounted(load)
     <CesiumGlobe
       v-if="!loading && !error"
       ref="globeRef"
-      :accidents="filteredPoints"
-      :density-grid="densityGrid"
       :show-markers="showMarkers"
       :show-density="showDensity"
-      @select="(point) => (selectedPoint = point)"
+      @select="selectPoint"
+      @zoomed-out-change="zoomedOut = $event"
     />
+
+    <div
+      v-if="!loading && !error && zoomedOut"
+      class="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-lg border border-border bg-surface-panel/95 px-4 py-2 text-sm text-text-base shadow-xl backdrop-blur"
+    >
+      Zoom in to see individual accidents — colors show all-time historical concentration
+    </div>
 
     <div v-if="loading" class="flex h-full w-full items-center justify-center">
       <p class="text-muted">Loading accident data…</p>
@@ -53,7 +65,7 @@ onMounted(load)
         :states="availableStates"
         :selected-state="stateFilter"
         :year-filter="yearFilter"
-        :accident-count="filteredPoints.length"
+        :result-count="filteredCount"
         @update:show-markers="showMarkers = $event"
         @update:show-density="showDensity = $event"
         @update:selected-state="stateFilter = $event"

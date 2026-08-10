@@ -1,22 +1,35 @@
 import { computed, ref } from 'vue'
-import type { AccidentDetail, AccidentPoint, DensityCell, YearFilter } from '@/types/accident'
+import type { AccidentDetail, AccidentPoint, DensityCell, TileManifestEntry, YearCountsByState, YearFilter } from '@/types/accident'
+import { tileKeyFor } from '@/types/accident'
 
+export interface ViewBounds {
+  west: number
+  south: number
+  east: number
+  north: number
+}
+
+const manifest = ref<TileManifestEntry[]>([])
+const availableStates = ref<string[]>([])
 const points = ref<AccidentPoint[]>([])
 const densityGrid = ref<DensityCell[]>([])
 const detailsById = ref<Record<string, AccidentDetail>>({})
+const yearCountsByState = ref<YearCountsByState>({})
 
-const loading = ref(true) // blocks first render — set false once points+density arrive
+const loading = ref(true) // blocks first render — set false once manifest/states/density arrive
 const loaded = ref(false)
 const error = ref<string | null>(null)
 
-const detailsLoading = ref(false) // does not block render — fetched in the background
-const detailsError = ref<string | null>(null)
+const detailsLoading = ref(false)
 
 const stateFilter = ref<string | null>(null)
-// Defaults to the narrowest non-trivial range — fewer map entities to build/cluster on first
-// load is faster than "all time", since every option is served from the same already-fetched file.
 const yearFilter = ref<YearFilter>('5y')
 let started = false
+
+const loadedPointTiles = new Set<string>()
+const pendingPointTiles = new Map<string, Promise<void>>()
+const loadedDetailTiles = new Set<string>()
+const pendingDetailTiles = new Map<string, Promise<void>>()
 
 function matchesYearFilter(year: number, filter: YearFilter): boolean {
   const currentYear = new Date().getUTCFullYear()
@@ -42,22 +55,84 @@ const filteredPoints = computed(() => {
   })
 })
 
-const availableStates = computed(() => {
-  const states = new Set(points.value.map((p) => p.state))
-  return [...states].sort()
+/** Total accidents matching the active state/year filter across the whole dataset — independent
+ * of which map tiles happen to be loaded, so it doesn't fluctuate as the user pans/zooms. */
+const filteredCount = computed(() => {
+  const states = stateFilter.value ? [stateFilter.value] : Object.keys(yearCountsByState.value)
+  let total = 0
+  for (const state of states) {
+    const byYear = yearCountsByState.value[state]
+    if (!byYear) continue
+    for (const [yearStr, count] of Object.entries(byYear)) {
+      if (matchesYearFilter(Number(yearStr), yearFilter.value)) total += count
+    }
+  }
+  return total
 })
 
-async function loadDetailsInBackground(): Promise<void> {
+function tileIntersectsBounds(tile: TileManifestEntry, bounds: ViewBounds): boolean {
+  return tile.lonMin < bounds.east && tile.lonMax > bounds.west && tile.latMin < bounds.north && tile.latMax > bounds.south
+}
+
+/** Fetches point tiles intersecting the given lat/lon bounds (degrees) that haven't been
+ * loaded yet. Safe to call repeatedly — already-loaded/in-flight tiles are skipped. */
+async function ensureTilesLoaded(bounds: ViewBounds): Promise<void> {
+  if (bounds.west > bounds.east) return // antimeridian-spanning views only occur at very low zoom, where tiles aren't fetched anyway
+
+  const toFetch = manifest.value.filter((t) => !loadedPointTiles.has(t.key) && tileIntersectsBounds(t, bounds))
+  if (toFetch.length === 0) return
+
+  await Promise.all(
+    toFetch.map((tile) => {
+      const existing = pendingPointTiles.get(tile.key)
+      if (existing) return existing
+
+      const promise = (async () => {
+        try {
+          const res = await fetch(`/data/tiles/points/${tile.key}.json`)
+          if (!res.ok) return
+          const tilePoints = (await res.json()) as AccidentPoint[]
+          points.value = [...points.value, ...tilePoints]
+          loadedPointTiles.add(tile.key)
+        } finally {
+          pendingPointTiles.delete(tile.key)
+        }
+      })()
+
+      pendingPointTiles.set(tile.key, promise)
+      return promise
+    }),
+  )
+}
+
+/** Lazily fetches the detail shard for the tile containing (latitude, longitude), merging it
+ * into detailsById. A single shard covers every accident in that tile, so repeat clicks within
+ * the same tile are free after the first fetch. */
+async function ensureDetail(id: string, latitude: number, longitude: number): Promise<void> {
+  if (detailsById.value[id]) return
+
+  const key = tileKeyFor(latitude, longitude)
+  if (loadedDetailTiles.has(key)) return
+
+  const existing = pendingDetailTiles.get(key)
+  if (existing) return existing
+
   detailsLoading.value = true
-  try {
-    const res = await fetch('/data/accident-details.json')
-    if (!res.ok) throw new Error('Failed to load accident details')
-    detailsById.value = await res.json()
-  } catch (e) {
-    detailsError.value = e instanceof Error ? e.message : 'Failed to load accident details'
-  } finally {
-    detailsLoading.value = false
-  }
+  const promise = (async () => {
+    try {
+      const res = await fetch(`/data/tiles/details/${key}.json`)
+      if (!res.ok) return
+      const shard = (await res.json()) as Record<string, AccidentDetail>
+      detailsById.value = { ...detailsById.value, ...shard }
+      loadedDetailTiles.add(key)
+    } finally {
+      pendingDetailTiles.delete(key)
+      detailsLoading.value = false
+    }
+  })()
+
+  pendingDetailTiles.set(key, promise)
+  return promise
 }
 
 async function load(): Promise<void> {
@@ -66,30 +141,32 @@ async function load(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    const [pointsRes, densityRes] = await Promise.all([
-      fetch('/data/accidents.json'),
+    const [manifestRes, statesRes, densityRes, yearCountsRes] = await Promise.all([
+      fetch('/data/tiles/manifest.json'),
+      fetch('/data/states.json'),
       fetch('/data/density-grid.json'),
+      fetch('/data/year-counts-by-state.json'),
     ])
-    if (!pointsRes.ok || !densityRes.ok) {
+    if (!manifestRes.ok || !statesRes.ok || !densityRes.ok || !yearCountsRes.ok) {
       throw new Error('Failed to load accident data')
     }
-    points.value = await pointsRes.json()
+    manifest.value = await manifestRes.json()
+    availableStates.value = await statesRes.json()
     densityGrid.value = await densityRes.json()
+    yearCountsByState.value = await yearCountsRes.json()
     loaded.value = true
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to load accident data'
   } finally {
     loading.value = false
   }
-
-  // Fire-and-forget: the map is already usable at this point, details fill in as they arrive.
-  void loadDetailsInBackground()
 }
 
 export function useAccidentsData() {
   return {
     points,
     filteredPoints,
+    filteredCount,
     densityGrid,
     detailsById,
     availableStates,
@@ -99,7 +176,8 @@ export function useAccidentsData() {
     loaded,
     error,
     detailsLoading,
-    detailsError,
     load,
+    ensureTilesLoaded,
+    ensureDetail,
   }
 }
