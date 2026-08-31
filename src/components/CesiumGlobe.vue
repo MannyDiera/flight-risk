@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as Cesium from 'cesium'
 import type { AccidentPoint, DensityCell } from '@/types/accident'
 import { useAccidentsData, type ViewBounds } from '@/composables/useAccidentsData'
+import { STATE_BOUNDS } from '@/data/stateBounds'
 
 const props = defineProps<{
   showMarkers: boolean
@@ -12,9 +13,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [point: AccidentPoint]
   'zoomed-out-change': [zoomedOut: boolean]
+  'zoom-progress': [value: number]
 }>()
 
-const { filteredPoints, densityGrid, ensureTilesLoaded } = useAccidentsData()
+const { filteredPoints, densityGrid, stateFilter, ensureTilesLoaded } = useAccidentsData()
 
 const container = ref<HTMLDivElement | null>(null)
 let viewer: Cesium.Viewer | null = null
@@ -32,6 +34,11 @@ const CONUS_NORTH = 50
 // layer is shown. Keeps rendered/clustered entity counts bounded regardless of how much data
 // the active year filter would otherwise match (e.g. "All time" is 39k+ points).
 const MARKER_ALTITUDE_THRESHOLD_METERS = 800_000
+// Camera altitude at/above which the "zoom in" progress bar reads 0%. Roughly the altitude of the
+// default CONUS view, so the bar sits empty at rest and fills as the user zooms toward
+// MARKER_ALTITUDE_THRESHOLD_METERS (where it reads 100% and markers begin to load). Interpolated
+// in log space (see computeZoomProgress) since zoom is exponential.
+const PROGRESS_START_ALTITUDE_METERS = 6_000_000
 // Height above the ellipsoid for accident markers — see the comment at their entity definition.
 const MARKER_HEIGHT_METERS = 1_000
 // Extra margin (degrees) around the current view when deciding which tiles/points to load and
@@ -165,6 +172,43 @@ function flyToConus(durationSeconds = 1.2): void {
   })
 }
 
+// Frames the selected state's bounding box with ~12% margin so its border isn't flush with the
+// viewport edge. Large states (TX, CA, AK) still end up framed above MARKER_ALTITUDE_THRESHOLD_METERS,
+// so the "zoom in" hint stays up until the user zooms further — expected, not a bug.
+function flyToStateBounds(code: string, durationSeconds = 1.2): void {
+  if (!viewer) return
+  const box = STATE_BOUNDS[code]
+  if (!box) return
+  const [west, south, east, north] = box
+  const padX = (east - west) * 0.12
+  const padY = (north - south) * 0.12
+  viewer.camera.flyTo({
+    destination: Cesium.Rectangle.fromDegrees(west - padX, south - padY, east + padX, north + padY),
+    duration: durationSeconds,
+  })
+}
+
+// 0 at/above PROGRESS_START_ALTITUDE_METERS, 1 at/below MARKER_ALTITUDE_THRESHOLD_METERS, linear
+// in log(height) between them.
+function computeZoomProgress(height: number): number {
+  const start = Math.log(PROGRESS_START_ALTITUDE_METERS)
+  const end = Math.log(MARKER_ALTITUDE_THRESHOLD_METERS)
+  const t = (start - Math.log(height)) / (start - end)
+  return Math.min(1, Math.max(0, t))
+}
+
+let lastEmittedProgress = -1
+
+// Runs every rendered frame (cheap: one height read + a compare). Only emits when the value moves
+// enough to matter, so an idle camera produces no events.
+function sampleZoomProgress(): void {
+  if (!viewer) return
+  const p = computeZoomProgress(viewer.camera.positionCartographic.height)
+  if (Math.abs(p - lastEmittedProgress) < 0.005) return
+  lastEmittedProgress = p
+  emit('zoom-progress', p)
+}
+
 function raiseMarkersAboveDensity(): void {
   // Without an explicit z-order, whichever data source was (re)added most recently paints on
   // top — keep markers above the density overlay.
@@ -288,7 +332,9 @@ onMounted(() => {
   viewer.camera.moveEnd.addEventListener(() => {
     void refreshMarkers()
   })
+  viewer.scene.preRender.addEventListener(sampleZoomProgress)
   void refreshMarkers()
+  sampleZoomProgress()
 
   viewer.screenSpaceEventHandler.setInputAction(handleClick, Cesium.ScreenSpaceEventType.LEFT_CLICK)
   viewer.screenSpaceEventHandler.setInputAction(handleMouseMove, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
@@ -304,6 +350,19 @@ onBeforeUnmount(() => {
 watch(filteredPoints, () => {
   rebuildAccidentsDataSource()
 })
+
+// Picking a state frames it; clearing the filter ("All states") returns to the CONUS view. A
+// non-state NTSB region code (no STATE_BOUNDS entry) leaves the camera untouched.
+watch(
+  () => stateFilter.value,
+  (code) => {
+    if (code) {
+      if (STATE_BOUNDS[code]) flyToStateBounds(code)
+    } else {
+      flyToConus()
+    }
+  },
+)
 
 watch(
   () => props.showMarkers,
